@@ -4,7 +4,7 @@ num_gpus=1
 export PYTHONPATH=/home/$USER/MCL:$PYTHONPATH
 
 srun -p p-A100 --nodelist=pgpu14 --job-name=$jobname --gres=gpu:$num_gpus -n 1 --ntasks-per-node=1 --cpus-per-task=6 \
-python -u contrast/train_fix_con_balance.py \
+python -u train_fix_con_balance.py \
 					--source clipart \
 					--target sketch \
 					--num 3 \
