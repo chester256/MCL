@@ -35,8 +35,6 @@ class RevGrad(Function):
 
 
 grad_reverse = RevGrad.apply
-# def grad_reverse(x, lambd=1.0):
-#     return GradReverse(lambd)(x)
 
 
 def l2_norm(input):
@@ -75,14 +73,6 @@ class AlexNetBase(nn.Module):
         return self.__in_features
 
     def get_optim_params(self, lr):
-        # lr_list, lr_multi_list = [], []
-        # for name, param in self.named_parameters():
-        #     if 'classifier' in name:
-        #         lr_multi_list.append(param)
-        #     else:
-        #         lr_list.append(param)
-        # return [{'params': lr_list, 'lr': lr},
-        #         {'params': lr_multi_list, 'lr': 10 * lr}]
         lr_list, lr_multi_list = [], []
         for name, param in self.named_parameters():
             lr_list.append(param)
