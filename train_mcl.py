@@ -26,7 +26,7 @@ def get_args():
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
     parser.add_argument('--bs', default=24, type=int)
     parser.add_argument('--bs_unl_multi', default=2, type=int)
-    parser.add_argument('--n_workers', default=6, type=int)
+    parser.add_argument('--n_workers', default=4, type=int)
     parser.add_argument('--source', type=str, default='painting')
     parser.add_argument('--target', type=str, default='real')
     parser.add_argument('--seed', type=int, default=12345, metavar='S',
