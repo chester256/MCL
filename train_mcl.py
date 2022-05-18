@@ -4,16 +4,9 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-import numpy as np
-import ot
-
 import os
-import sys
 import argparse
 from tqdm import tqdm
-import pdb
-import copy
-import time
 
 from loaders.domainnet import build_dataset
 from loaders.office_home import build_dataset_officehome
@@ -23,7 +16,7 @@ from utils.lr_schedule import InvLr
 from utils.ema import ModelEMA
 from model.basenet import Predictor_deep
 from model.resnet import resnet34
-from utils.losses import Prototype, ot_loss, contras_cls
+from utils.losses import Prototype, loss_unl
 
 
 def get_args():
@@ -58,7 +51,6 @@ def get_args():
                         help='temperature (default: 0.05)')
     parser.add_argument('--lambda_u', type=float, default=1)
     parser.add_argument('--lambda_cls', type=float, default=1)
-    parser.add_argument('--lambda_entmax', type=float, default=0.1)
     parser.add_argument('--lambda_ot', type=float, default=1)
     parser.add_argument('--log_dir', type=str, default='./logs/domainnet/contras_cls/debug')
     parser.add_argument('--save', action='store_true', default=False)
@@ -66,7 +58,7 @@ def get_args():
     parser.add_argument('--test_interval', type=float, default=500)
     parser.add_argument('--print_interval', type=float, default=50)
     parser.add_argument('--num_steps', type=int, default=50000)
-    parser.add_argument('--warm_steps', type=int, default=100)
+    parser.add_argument('--warm_steps', type=int, default=250)
     args = parser.parse_args()
     return args
 
@@ -90,8 +82,6 @@ def train(source_loader, target_loader, target_loader_unl, target_loader_val, ta
 
     net_G_ema = ModelEMA(net_G, decay=0.99)
     net_F_ema = ModelEMA(net_F, decay=0.99)
-    net_G_ema2 = ModelEMA(net_G, decay=0.995)
-    net_F_ema2 = ModelEMA(net_F, decay=0.995)
 
     proto_s = Prototype(C=args.num_classes, dim=args.inc)
 
@@ -137,25 +127,7 @@ def train(source_loader, target_loader, target_loader_unl, target_loader_val, ta
         else:
             Lx = criterion(out1, target)
 
-        # target unl
-        feat_tu = net_G(torch.cat((imgs_tu_w, imgs_tu_s), dim=0))
-        feat_tu_con, logits_tu = net_F(feat_tu)
-        feat_tu_w, feat_tu_s = feat_tu_con.chunk(2)
-        logits_tu_w, logits_tu_s = logits_tu.chunk(2)
-
-        # fixmatch loss
-        pseudo_label = torch.softmax(logits_tu_w.detach() * args.T2, dim=-1)
-        max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-        consis_mask = max_probs.ge(args.threshold).float()
-        L_fix = (F.cross_entropy(logits_tu_s, targets_u, reduction='none') * consis_mask).mean()
-
-        # clustering loss
-        prob_tu_w = torch.softmax(logits_tu_w, dim=1)
-        prob_tu_s = torch.softmax(logits_tu_s, dim=1)
-        L_con_cls = contras_cls(prob_tu_w, prob_tu_s)
-
-        # ot loss
-        L_ot = ot_loss(proto_s, feat_tu_w, feat_tu_s, targets_u. args)
+        L_ot, L_con_cls, L_fix, consis_mask = loss_unl(net_G, net_F, imgs_tu_w, imgs_tu_s, proto_s, args)
 
         # backward
         Loss = Lx + L_fix * args.lambda_u + L_con_cls * args.lambda_cls + lambda_warm * L_ot * args.lambda_ot
@@ -165,8 +137,6 @@ def train(source_loader, target_loader, target_loader_unl, target_loader_val, ta
         scheduler.step(batch_idx)
         net_G_ema.update(net_G)
         net_F_ema.update(net_F)
-        net_G_ema2.update(net_G)
-        net_F_ema2.update(net_F)
 
         proto_s.update(feat_s, gt_s, batch_idx, norm=True)
 
@@ -184,34 +154,27 @@ def train(source_loader, target_loader, target_loader_unl, target_loader_val, ta
             writer.add_scalar('Learning rate', optimizer.param_groups[0]['lr'], batch_idx)
 
             acc_val = test(target_loader_val, net_G_ema.ema, net_F_ema.ema, batch_idx)
-            acc1, acc2, acc, per_acc1, per_acc2, per_acc, _ = test_multi(target_loader_test,
-                                                                         net_G, net_F,
-                                                                         net_G_ema.ema, net_F_ema.ema,
-                                                                         net_G_ema2.ema, net_F_ema2.ema)
+            acc1, acc2,  per_acc1, per_acc2 = test_multi(target_loader_test,
+                                                         net_G, net_F,
+                                                         net_G_ema.ema, net_F_ema.ema)
             writer.add_scalar('Test/acc', acc1, batch_idx)
             writer.add_scalar('Test/acc_ema', acc2, batch_idx)
-            writer.add_scalar('Test/acc_ema2', acc, batch_idx)
             writer.add_scalar('Test/mAcc', per_acc1, batch_idx)
             writer.add_scalar('Test/mAcc_ema', per_acc2, batch_idx)
-            writer.add_scalar('Test/mAcc_ema2', per_acc, batch_idx)
 
-            if acc > best_acc_val:
+            if acc_val > best_acc_val:
                 best_acc_val = acc_val
                 cur_acc_test = acc1
                 cur_acc_test_ema = acc2
                 if args.save:
                     net_F_path = os.path.join(args.log_dir, 'ckpt', 'Best_F.pth')
                     net_F_ema_path = os.path.join(args.log_dir, 'ckpt', 'Best_F_ema.pth')
-                    net_F_ema2_path = os.path.join(args.log_dir, 'ckpt', 'Best_F_ema2.pth')
                     net_G_path = os.path.join(args.log_dir, 'ckpt', 'Best_G.pth')
                     net_G_ema_path = os.path.join(args.log_dir, 'ckpt', 'Best_G_ema.pth')
-                    net_G_ema2_path = os.path.join(args.log_dir, 'ckpt', 'Best_G_ema2.pth')
                     torch.save(net_G.state_dict(), net_G_path)
                     torch.save(net_F.state_dict(), net_F_path)
                     torch.save(net_G_ema.ema.state_dict(), net_G_ema_path)
                     torch.save(net_F_ema.ema.state_dict(), net_F_ema_path)
-                    torch.save(net_G_ema2.ema.state_dict(), net_G_ema2_path)
-                    torch.save(net_F_ema2.ema.state_dict(), net_F_ema2_path)
             writer.add_scalar('Test/BestAcc', cur_acc_test, batch_idx)
             writer.add_scalar('Test/BestAcc_ema', cur_acc_test_ema, batch_idx)
 
@@ -241,17 +204,13 @@ def test(test_loader, net_G, net_F, iter_idx):
     return acc
 
 
-def test_multi(test_loader, net_G1, net_F1, net_G2, net_F2, net_G3, net_F3):
+def test_multi(test_loader, net_G1, net_F1, net_G2, net_F2):
     global args, writer
     net_G1.eval()
     net_F1.eval()
     net_G2.eval()
     net_F2.eval()
-    net_G3.eval()
-    net_F3.eval()
 
-    correct = 0
-    total = 0
     correct1 = 0
     total1 = 0
     correct2 = 0
@@ -269,51 +228,38 @@ def test_multi(test_loader, net_G1, net_F1, net_G2, net_F2, net_G3, net_F3):
             inputs, targets = data_batch[0][0].cuda(), data_batch[1].cuda()
         _, outputs1 = net_F1(net_G1(inputs))
         _, outputs2 = net_F2(net_G2(inputs))
-        _, outputs = net_F3(net_G3(inputs))
 
         l = 0.5
         outputs1 = torch.softmax(outputs1, dim=1)
         outputs2 = torch.softmax(outputs2, dim=1)
-        outputs = torch.softmax(outputs, dim=1)
-        max_prob, predicted = outputs.max(1)
         max_prob, predicted1 = outputs1.max(1)
         max_prob, predicted2 = outputs2.max(1)
         total += targets.size(0)
 
-        correct += predicted.eq(targets).sum().item()
         correct1 += predicted1.eq(targets).sum().item()
         correct2 += predicted2.eq(targets).sum().item()
 
         predicted_list1 += predicted1.cpu().numpy().tolist()
         predicted_list2 += predicted2.cpu().numpy().tolist()
-        predicted_list += predicted.cpu().numpy().tolist()
         target_list += targets.cpu().numpy().tolist()
 
     from sklearn.metrics import confusion_matrix
     cm1 = confusion_matrix(target_list, predicted_list1, normalize='true')
     cm2 = confusion_matrix(target_list, predicted_list2, normalize='true')
-    cm = confusion_matrix(target_list, predicted_list, normalize='true')
 
     per_acc1 = cm1.diagonal().mean() * 100.
     per_acc2 = cm2.diagonal().mean() * 100.
-    per_acc = cm.diagonal().mean() * 100.
 
     net_G1.train()
     net_F1.train()
     net_G2.train()
     net_F2.train()
-    acc = correct / total * 100.
     acc1 = correct1 / total * 100.
     acc2 = correct2 / total * 100.
-    print('acc1 %.2f acc2 %.2f acc_ens %.2f' % (acc1, acc2, acc))
-    print('mAcc1 %.2f mAcc2 %.2f mAcc_ens %.2f' % (per_acc1, per_acc2, per_acc))
+    print('acc1 %.2f acc2 %.2f ' % (acc1, acc2))
+    print('mAcc1 %.2f mAcc2 %.2f ' % (per_acc1, per_acc2))
 
-    select_cls = np.where(cm1.diagonal() > 0.1)[0]
-    if args.num_classes == 12:
-        print(cm1.diagonal())
-        print(cm2.diagonal())
-
-    return acc1, acc2, acc, per_acc1, per_acc2, per_acc, select_cls
+    return acc1, acc2,  per_acc1, per_acc2
 
 
 def get_optim_params(model, lr):
